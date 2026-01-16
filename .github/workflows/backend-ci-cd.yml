@@ -41,6 +41,7 @@ jobs:
           distribution: temurin
           java-version: ${{ env.JAVA_VERSION }}
 
+          
       - name: Maven build and test
         run: mvn -B -ntp -f mvp/pom.xml clean verify -Dspring.profiles.active=ci
         env:
