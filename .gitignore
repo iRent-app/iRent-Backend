@@ -1,0 +1,28 @@
+GITHUB_ACTIONS_VARIABLES.md
+Tarik_guide.md
+
+.env
+AWS_ECS_SETUP.md
+GITHUB_SECRETS_SETUP.md
+task-definition.json
+github-actions-policy.json
+
+
+# Local temp and sensitive fileS
+tmp/
+tmp/gha-oidc-trust.json
+
+# Terraform
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup
+terraform/*.tfvars
+terraform/terraform-outputs.txt
+.terraform/
+*.tfstate
+*.tfstate.backup
+
+
+.terraform.lock.hcl
+SECRETS_BACKEND.md
