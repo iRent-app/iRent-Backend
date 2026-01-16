@@ -1,0 +1,290 @@
+name: backend-ci-cd
+
+on:
+  pull_request:
+    paths:
+      - "mvp/**"
+      - "pom.xml"
+  push:
+    branches: [feature/pipeline, main]
+
+env:
+  JAVA_VERSION: "25"
+  IMAGE_NAME: backend
+  REGISTRY: ghcr.io
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECS_CLUSTER: ${{ secrets.ECS_CLUSTER }}
+  ECS_SERVICE: ${{ secrets.ECS_SERVICE }}
+  ECS_TASK_DEFINITION: ${{ secrets.ECS_TASK_DEFINITION }}
+  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+  AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+  DORA_METRICS_REPO: ${{ github.repository_owner }}/dora-metrics
+
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    services:
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          MSSQL_SA_PASSWORD: MyP@ssw0rd123!
+          ACCEPT_EULA: "Y"
+        ports:
+          - 1433:1433
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Maven build and test
+        run: mvn -B -ntp -f mvp/pom.xml clean verify -Dspring.profiles.active=ci
+        env:
+          SPRING_DATASOURCE_URL: jdbc:sqlserver://localhost:1433;databaseName=master;encrypt=false;trustServerCertificate=true
+          SPRING_DATASOURCE_USERNAME: sa
+          SPRING_DATASOURCE_PASSWORD: MyP@ssw0rd123!
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: maven-surefire-reports
+          path: mvp/target/surefire-reports
+
+  containerize:
+    needs: build-test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Docker image
+        run: |
+          docker build -t ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ github.sha }} ./mvp
+
+      - name: Push Docker image to GHCR
+        run: |
+          docker push ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+  deploy:
+    needs: containerize
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # local MSSQL run removed: MSSQL will be provisioned via Terraform-managed ECS service
+      - name: Set lowercase repository name
+        id: repo-name
+        run: |
+          echo "repo_owner_lower=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+          echo "repo_name_lower=$(echo '${{ github.event.repository.name }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          # aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          # aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          # aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Update ECS task definition
+        id: task-def
+        run: |
+          # Get current task Definition
+          TASK_DEFINITION=$(aws ecs describe-task-definition \
+            --task-definition ${{ secrets.ECS_TASK_DEFINITION }} \
+            --query 'taskDefinition' \
+            --output json)
+          
+          # Update container image
+          NEW_TASK_DEF=$(echo $TASK_DEFINITION | jq --arg IMAGE "${{ env.REGISTRY }}/${{ steps.repo-name.outputs.repo_owner_lower }}/${{ steps.repo-name.outputs.repo_name_lower }}:${{ github.sha }}" \
+            '.containerDefinitions[0].image = $IMAGE | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
+          
+          # Register new task definition
+          NEW_TASK_ARN=$(aws ecs register-task-definition \
+            --cli-input-json "$NEW_TASK_DEF" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          
+          echo "task_arn=$NEW_TASK_ARN" >> $GITHUB_OUTPUT
+          echo "✅ New task definition: $NEW_TASK_ARN"
+
+      - name: Update ECS service
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE }} \
+            --task-definition ${{ steps.task-def.outputs.task_arn }} \
+            --force-new-deployment
+          
+          echo "✅ ECS service updated with new task definition"
+          echo "🚀 Deployment initiated for image: ${{ env.REGISTRY }}/${{ steps.repo-name.outputs.repo_owner_lower }}/${{ steps.repo-name.outputs.repo_name_lower }}:${{ github.sha }}"
+
+      - name: Calculate DORA Metrics - Deployment Frequency
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "DEPLOYMENT_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_ENV
+          echo "DEPLOYMENT_VERSION=${{ github.sha }}" >> $GITHUB_ENV
+          echo "SERVICE_NAME=backend" >> $GITHUB_ENV
+      
+      - name: Calculate Lead Time for Changes
+        if: github.event_name != 'pull_request'
+        run: |
+          # Get commit timestamp
+          COMMIT_TIME=$(git show -s --format=%cI ${{ github.sha }})
+          DEPLOY_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          
+          echo "COMMIT_TIMESTAMP=$COMMIT_TIME" >> $GITHUB_ENV
+          echo "DEPLOY_TIMESTAMP=$DEPLOY_TIME" >> $GITHUB_ENV
+      
+      - name: Send DORA Metrics to Storage
+        if: github.event_name != 'pull_request'
+        run: |
+          # Create metrics JSON
+          cat > dora-metrics.json << EOF
+          {
+            "timestamp": "${{ env.DEPLOYMENT_TIMESTAMP }}",
+            "service": "${{ env.SERVICE_NAME }}",
+            "deployment_frequency": {
+              "deployment_id": "${{ github.run_id }}",
+              "deployment_time": "${{ env.DEPLOYMENT_TIMESTAMP }}",
+              "branch": "${{ github.ref_name }}",
+              "commit_sha": "${{ github.sha }}"
+            },
+            "lead_time_for_changes": {
+              "commit_timestamp": "${{ env.COMMIT_TIMESTAMP }}",
+              "deploy_timestamp": "${{ env.DEPLOY_TIMESTAMP }}",
+              "commit_sha": "${{ github.sha }}"
+            },
+            "change_failure_rate": {
+              "status": "success",
+              "workflow_run_id": "${{ github.run_id }}"
+            }
+          }
+          EOF
+          
+          # Store metrics (upload as artifact for later processing)
+          mkdir -p metrics
+          cp dora-metrics.json metrics/backend-${{ github.run_id }}.json
+      
+      - name: Upload DORA Metrics Artifact
+        if: github.event_name != 'pull_request' && success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dora-metrics-backend-${{ github.run_id }}
+          path: metrics/
+          retention-days: 90
+
+      - name: Init DORA CSV
+        if: always()
+        run: echo "service,event,status,commit,timestamp" > dora_events.csv
+
+      - name: Record DORA event (deploy success)
+        if: success()
+        run: printf "backend,deploy,success,${{ github.sha }},$(date -Iseconds)\n" >> dora_events.csv
+
+      - name: Record DORA event (deploy fail)
+        if: failure()
+        run: printf "backend,deploy,fail,${{ github.sha }},$(date -Iseconds)\n" >> dora_events.csv
+
+      - name: Send DORA event to dora-metrics (success)
+        if: success()
+        env:
+          DORA_TOKEN: ${{ secrets.DORA_METRICS_TOKEN }}
+        run: |
+          if [ -z "$DORA_TOKEN" ]; then
+            echo "DORA_METRICS_TOKEN not set; skipping push";
+            exit 0;
+          fi
+          payload=$(jq -n \
+            --arg service "backend" \
+            --arg status "success" \
+            --arg commit "${GITHUB_SHA}" \
+            --arg repo "${GITHUB_REPOSITORY}" \
+            --arg ts "$(date -Iseconds)" \
+            '{event_type:"dora-event", client_payload:{service:$service,status:$status,commit:$commit,repo:$repo,timestamp:$ts}}')
+          curl -s -X POST \
+            -H "Authorization: token $DORA_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/${{ secrets.DORA_METRICS_REPO }}/dispatches \
+            -d "$payload"
+
+      - name: Send DORA event to dora-metrics (fail)
+        if: failure()
+        env:
+          DORA_TOKEN: ${{ secrets.DORA_METRICS_TOKEN }}
+        run: |
+          if [ -z "$DORA_TOKEN" ]; then
+            echo "DORA_METRICS_TOKEN not set; skipping push";
+            exit 0;
+          fi
+          payload=$(jq -n \
+            --arg service "backend" \
+            --arg status "fail" \
+            --arg commit "${GITHUB_SHA}" \
+            --arg repo "${GITHUB_REPOSITORY}" \
+            --arg ts "$(date -Iseconds)" \
+            '{event_type:"dora-event", client_payload:{service:$service,status:$status,commit:$commit,repo:$repo,timestamp:$ts}}')
+          curl -s -X POST \
+            -H "Authorization: token $DORA_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/${{ env.DORA_METRICS_REPO }}/dispatches \
+            -d "$payload"
+
+      - name: Upload DORA CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dora-events
+          path: dora_events.csv
+
+  failure-tracking:
+    runs-on: ubuntu-latest
+    if: failure()
+    needs: deploy
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record Failure Metric
+        run: |
+          cat > failure-metric.json << EOF
+          {
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "service": "backend",
+            "change_failure_rate": {
+              "status": "failure",
+              "workflow_run_id": "${{ github.run_id }}",
+              "commit_sha": "${{ github.sha }}",
+              "branch": "${{ github.ref_name }}"
+            }
+          }
+          EOF
+          
+          mkdir -p metrics
+          cp failure-metric.json metrics/backend-failure-${{ github.run_id }}.json
+      
+      - name: Upload Failure Metric
+        uses: actions/upload-artifact@v4
+        with:
+          name: dora-metrics-backend-failure-${{ github.run_id }}
+          path: metrics/
+          retention-days: 90
